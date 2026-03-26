@@ -1,0 +1,1207 @@
+############ ------------------------------------------------------------
+############ Training population data made based on per se performance
+############ ------------------------------------------------------------
+#### Below script uses the following steps for implementing GS
+## Splits heterotic groups by markers
+## Trains prediction models on per se performance of training population lines
+## One training population for all heterotic groups
+
+
+## =====================================================================
+## ARGUMENTS / INTERACTIVE MODE
+## =====================================================================
+## If you're in R, define rep_id & workdir first; otherwise read commandArgs.
+if (exists("rep_id", inherits = FALSE) && exists("workdir", inherits = FALSE)) {
+  # interactive: use the pre-defined variables
+  rep_id  <- as.integer(rep_id)
+  workdir <- as.character(workdir)
+} else {
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) < 1) {
+    stop("Usage: GS_synthetic_Twopart_perse_DD1.R <rep_id> [workdir]")
+  }
+  rep_id  <- as.integer(args[1])
+  workdir <- if (length(args) >= 2) args[2] else getwd()
+}
+
+if (!dir.exists(workdir)) {
+  stop("Workdir does not exist: ", workdir)
+}
+setwd(workdir)
+
+
+## =====================================================================
+## PACKAGES
+## =====================================================================
+suppressPackageStartupMessages({
+  library(AlphaSimR)
+  library(dplyr)
+  library(rrBLUP)
+  library(tibble)
+  library(stats)
+  library(cluster)
+  library(BGLR)
+})
+
+## Always keep BLAS single-threaded inside an array task
+Sys.setenv(
+  OMP_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1",
+  VECLIB_MAXIMUM_THREADS = "1",
+  NUMEXPR_NUM_THREADS = "1"
+)
+
+
+## =====================================================================
+## INPUT FILES
+## =====================================================================
+load("SP_ADG_DD1.RData")
+load("Divpanel_ADG_DD1.RData")
+load(sprintf("workspace_ADG_DD1_%d_2.RData", rep_id))
+
+
+## =====================================================================
+## MAIN SIMULATION FUNCTION
+## =====================================================================
+model.mse <- function(rep_id) {
+  
+  ## -------------------------------------------------------------------
+  ## PARAMETERS
+  ## -------------------------------------------------------------------
+  
+  # Parents
+  nCyclesPI <- 2
+  nParents  <- 20
+  nOP       <- 8
+  nElite    <- 1
+  
+  nSelf     <- 16  # number of seeds per selfed F1
+  nself1    <- 1
+  nself2    <- 10
+  s2sel     <- 200 # number of individuals selected from S2 per heterotic group
+  s3sel     <- 20  # number of lines selected from each heterotic group
+  nsel_syn1 <- 4   # number of lines per heterotic group
+  nsel_syn2 <- 2   # number of varieties selected
+  
+  # Degree of selfing
+  selfing <- 0.5
+  
+  # Accuracy of trials
+  varE                <- 4  # error variance for field trials
+  reptraining         <- 3
+  repsyn1             <- 3
+  repsyn2             <- 9
+  reporiginaltraining <- 6
+  
+  
+  ## -------------------------------------------------------------------
+  ## HELPER FUNCTION
+  ## -------------------------------------------------------------------
+  
+  predictEBV_BGLR <- function(pop, p_tr, bA, bD = NULL, mu) {
+    G <- pullSnpGeno(pop)
+    G <- as.matrix(G)
+    storage.mode(G) <- "numeric"
+    
+    stopifnot(ncol(G) == length(p_tr), length(bA) == length(p_tr))
+    q_tr <- 1 - p_tr
+    
+    A  <- sweep(G, 2, 2 * p_tr, "-")
+    gv <- as.numeric(A %*% bA)
+    
+    if (!is.null(bD) && length(bD) > 0) {
+      stopifnot(length(bD) == length(p_tr))
+      het <- (G == 1) * 1
+      D   <- sweep(het, 2, 2 * p_tr * q_tr, "-")
+      gv  <- gv + as.numeric(D %*% bD)
+    }
+    
+    gv <- gv + mu
+    pop@ebv <- matrix(gv)
+    pop
+  }
+  
+  
+  ## -------------------------------------------------------------------
+  ## TRAINING POPULATION
+  ## -------------------------------------------------------------------
+  
+  # Add 100 random accessions from F4 (F4_split) to boost training population
+  add_training <- vector("list", length(F4_split)) # Keep lines separate
+  for (i in 1:length(F4_split)) {
+    add_training[[i]] <- selectInd(F4_split[[i]], nInd = 1, use = "rand")
+  }
+  add_training <- mergePops(add_training)
+  add_training <- selectInd(add_training, nInd = 100, use = "rand")
+  # These will be phenotyped in year 1
+  
+  
+  ## -------------------------------------------------------------------
+  ## CREATE HETEROTIC GROUPS
+  ## -------------------------------------------------------------------
+  
+  nGroups <- 5
+  
+  # Starting population
+  start_pop <- c(Parents_17, Parents_18, Parents_19)
+  
+  # 1. Extract genotype marker matrix (0/1/2 coding)
+  geno <- pullSnpGeno(start_pop)
+  
+  # 2. Calculate genetic distance matrix
+  G  <- A.mat(geno, min.MAF = 0.05, impute.method = "mean")
+  D2 <- outer(diag(G), diag(G), "+") - 2 * G
+  D2[D2 < 0] <- 0
+  D  <- as.dist(sqrt(D2))
+  
+  # 3. Perform hierarchical clustering
+  hc <- hclust(D, method = "ward.D2")
+  
+  # 4. Cut dendrogram into 5 clusters
+  clusters <- cutree(hc, k = nGroups)
+  
+  # 5. Assign cluster labels to individuals
+  start_pop@misc$cluster <- clusters
+  
+  rm(geno, G, D, hc, clusters)
+  
+  
+  ## -------------------------------------------------------------------
+  ## CREATE TESTERS
+  ## -------------------------------------------------------------------
+  
+  tester_list <- vector("list", nGroups)
+  
+  # Select one random individual from each cluster
+  for (k in 1:nGroups) {
+    cluster_inds <- which(start_pop@misc$cluster == k)
+    selected_ind <- sample(cluster_inds, 1)
+    tester_list[[k]] <- start_pop[selected_ind]
+  }
+  
+  # Combine into one tester population from which one inbred line is developed per tester
+  tester_pop <- makeDH(mergePops(tester_list))
+  
+  
+  ## -------------------------------------------------------------------
+  ## CREATE TRAINING POPULATION
+  ## -------------------------------------------------------------------
+  
+  ## Create training population by creating one inbred line from each accession
+  ## of diversity panel (start_pop should already be largely homozygous)
+  training <- makeDH(mergePops(list(start_pop, Divpanel)), nDH = 1)
+  
+  
+  ## -------------------------------------------------------------------
+  ## INITIAL TRAINING MODEL
+  ## -------------------------------------------------------------------
+  
+  # Per se performance as training data
+  training <- setPheno(training, varE = varE, reps = reporiginaltraining)
+  
+  training_by_year <- list()
+  training_by_year[["Y0"]] <- training
+  
+  # Global allele freqs from training
+  training_all <- mergePops(training_by_year)
+  G_tr <- as.matrix(pullSnpGeno(training_all))
+  storage.mode(G_tr) <- "numeric"
+  p_tr <- colMeans(G_tr) / 2
+  q_tr <- 1 - p_tr
+  
+  genoA_list <- vector("list", length(training_by_year))
+  genoD_list <- vector("list", length(training_by_year))
+  y_list     <- vector("list", length(training_by_year))
+  
+  for (k in seq_along(training_by_year)) {
+    tr_pop <- training_by_year[[k]]
+    y_list[[k]] <- as.numeric(tr_pop@pheno)
+    
+    G <- as.matrix(pullSnpGeno(tr_pop))
+    storage.mode(G) <- "numeric"
+    
+    stopifnot(ncol(G) == length(p_tr))
+    
+    A_blk <- sweep(G, 2, 2 * p_tr, "-")
+    het   <- (G == 1) * 1
+    D_blk <- sweep(het, 2, 2 * p_tr * q_tr, "-")
+    
+    genoA_list[[k]] <- A_blk
+    genoD_list[[k]] <- D_blk
+  }
+  
+  genoA <- do.call(rbind, genoA_list)
+  # genoD <- do.call(rbind, genoD_list)
+  y <- unlist(y_list)
+  
+  ETA <- list(
+    list(X = genoA, model = "BRR")
+    # list(X = genoD, model = "BRR")
+  )
+  
+  fit <- BGLR(y = y, ETA = ETA, nIter = 10000, burnIn = 3000, verbose = FALSE)
+  bA <- fit$ETA[[1]]$b
+  # bD <- fit$ETA[[2]]$b
+  mu <- as.numeric(fit$mu)
+  bD <- NULL  # all individuals completely homozygous in first training population, no dominance
+  
+  
+  ## -------------------------------------------------------------------
+  ## POPULATIONS FOR FILLING PIPELINE
+  ## -------------------------------------------------------------------
+  
+  # Split heterotic pools to form initial parents
+  parent_groups <- lapply(1:nGroups, function(k) {
+    subset(start_pop, start_pop@misc$cluster == k)
+  })
+  
+  # Select random elites from each group
+  elite_groups <- lapply(parent_groups, function(group) {
+    selectInd(group, nElite, use = "rand")
+  })
+  
+  ### Produce elite line groups
+  G1 <- c(elite_groups[[2]], elite_groups[[3]], elite_groups[[4]], elite_groups[[5]])
+  G2 <- c(elite_groups[[1]], elite_groups[[3]], elite_groups[[4]], elite_groups[[5]])
+  G3 <- c(elite_groups[[4]], elite_groups[[1]], elite_groups[[2]], elite_groups[[5]])
+  G4 <- c(elite_groups[[1]], elite_groups[[2]], elite_groups[[3]], elite_groups[[5]])
+  G5 <- c(elite_groups[[1]], elite_groups[[2]], elite_groups[[3]], elite_groups[[4]])
+  
+  # Elite lines to use in first synthetics
+  synthetics <- list(G1, G2, G3, G4, G5)
+  
+  tester_pop <- c(
+    elite_groups[[1]], elite_groups[[2]], elite_groups[[3]],
+    elite_groups[[4]], elite_groups[[5]]
+  )
+  
+  
+  ## -------------------------------------------------------------------
+  ## START BREEDING CYCLE
+  ## -------------------------------------------------------------------
+  
+  nYears <- 20
+  output <- data.frame(year = 1:nYears)
+  
+  for (year in 1:nYears) {
+    
+    cat("Cycle year:", year, "of 20\n")
+    
+    if (year == 1) {
+      
+      ## ===============================================================
+      ## YEAR 1
+      ## ===============================================================
+      
+      ## ---------------------------------------------------------------
+      ## CREATION OF SYNTHETIC VARIETIES
+      ## ---------------------------------------------------------------
+      
+      # These activities are run as if they have been performed during the
+      # last few years of burnin
+      
+      # First synthetic varieties created with selected parents from year 17,18,19
+      # of burnin. Filling last steps of pipeline with synthetics derived from these lines
+      
+      # Create SYN0 by crossing all the synthetic components
+      syn0 <- replicate(n = 5, expr = { list() }, simplify = FALSE)
+      for (group in seq_along(parent_groups)) {
+        for (i in 1:length(parent_groups[[group]])) {
+          open1 <- mergePops(list(parent_groups[[group]][i], synthetics[[group]]))
+          syn0[[group]][i] <- selectOP(
+            open1,
+            nInd          = 5,
+            nSeeds        = 500,
+            probSelf      = selfing,
+            pollenControl = FALSE,
+            use           = "rand"
+          )
+        }
+      }
+      
+      # Random open pollination of Syn0 to produce Syn1
+      syn1 <- replicate(n = 5, expr = { list() }, simplify = FALSE)
+      for (group in seq_along(syn1)) {
+        for (i in 1:length(syn0[[group]])) {
+          syn1[[group]][[i]] <- selectOP(
+            syn0[[group]][[i]],
+            nInd     = 2000,
+            nSeeds   = 1,
+            use      = "rand",
+            probSelf = selfing
+          )
+          syn1[[group]][[i]] <- setPheno(syn1[[group]][[i]], varE = varE, reps = repsyn1)
+        }
+      }
+      
+      # Calculate mean phenotype per SYN1 subpopulation
+      Syn1_mean <- vector("list", length(syn1))
+      for (group in seq_along(syn1)) {
+        group_means <- sapply(syn1[[group]], function(pop) mean(pop@pheno, na.rm = TRUE))
+        Syn1_mean[[group]] <- data.frame(
+          index = seq_along(group_means),
+          mean_pheno = group_means
+        )
+      }
+      
+      # Select top-performing subpopulations in each group
+      Syn1_sel <- vector("list", length(syn1))
+      for (group in seq_along(syn1)) {
+        mean_df <- Syn1_mean[[group]]
+        top_indices <- order(mean_df$mean_pheno, decreasing = TRUE)[1:nsel_syn1]
+        Syn1_sel[[group]] <- syn1[[group]][top_indices]
+      }
+      
+      # Combine selected subpopulations from all groups
+      Syn1_sel <- unlist(Syn1_sel, recursive = FALSE)
+      
+      # Open pollination of Syn-2 to produce Syn-3 and phenotype
+      syn2 <- lapply(Syn1_sel, function(line) {
+        pop <- selectOP(
+          line,
+          nInd          = 500,
+          nSeeds        = 4,
+          probSelf      = selfing,
+          pollenControl = FALSE,
+          use           = "rand"
+        )
+        setPheno(pop, varE = varE, reps = repsyn2)
+      })
+      
+      # Selection from Syn2: random selection as phenotype not collected until first year
+      Syn2_sel <- sample(syn2, size = nsel_syn2, replace = FALSE)
+      
+      # Creation of Syn3
+      syn3 <- vector("list", length(Syn2_sel))
+      for (group in seq_along(Syn2_sel)) {
+        syn3[[group]] <- selectOP(
+          pop           = Syn2_sel[[group]],
+          nInd          = 200,
+          nSeeds        = 10,
+          probSelf      = selfing,
+          pollenControl = FALSE,
+          use           = "rand"
+        )
+      }
+      
+      synthetic_var <- mergePops(syn3)
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 3
+      ## ---------------------------------------------------------------
+      
+      F3 <- mergePops(F3)
+      maf_min <- 0.05
+      
+      # Split F3 population into heterotic groups aligned with parental groups
+      G_ind   <- pullSnpGeno(F3)
+      AF_grpL <- lapply(parent_groups, \(p) colMeans(pullSnpGeno(p), na.rm = TRUE) / 2)
+      AF_grp  <- do.call(rbind, AF_grpL)
+      
+      # Global allele frequency (across inds + group refs) for standardization
+      p_all <- colMeans(rbind(G_ind / 2, AF_grp), na.rm = TRUE)
+      
+      # MAF filter
+      keep   <- which(p_all > maf_min & p_all < 1 - maf_min)
+      G_ind  <- G_ind[, keep, drop = FALSE]
+      AF_grp <- AF_grp[, keep, drop = FALSE]
+      p_all  <- p_all[keep]
+      m      <- length(keep)
+      
+      # Standardization denominator
+      std <- sqrt(2 * p_all * (1 - p_all))
+      std[std == 0] <- 1
+      
+      # Z for individuals
+      Z_ind <- sweep(G_ind, 2, 2 * p_all, "-")
+      Z_ind <- sweep(Z_ind, 2, std, "/")
+      Z_ind[!is.finite(Z_ind)] <- 0
+      
+      # Z for group centers
+      Z_grp <- sweep(2 * AF_grp, 2, 2 * p_all, "-")
+      Z_grp <- sweep(Z_grp, 2, std, "/")
+      Z_grp[!is.finite(Z_grp)] <- 0
+      
+      # Similarity of each individual to each group center
+      S <- Z_ind %*% t(Z_grp) / m
+      
+      # Assign group = argmax similarity
+      group_assign <- max.col(S, ties.method = "random")
+      
+      # Store on Pop and split
+      F3@misc$cluster <- group_assign
+      S3 <- lapply(split(seq_len(nInd(F3)), group_assign), function(idx) F3[idx])
+      
+      # Apply genomic selection on F3
+      S3 <- lapply(S3, function(F3) {
+        predictEBV_BGLR(F3, p_tr, bA, bD, mu)
+      })
+      
+      S3s_sel <- lapply(S3, function(F3) {
+        selectFam(F3, nFam = s3sel, use = "ebv", famType = "F")
+      })
+      
+      # Split lines by mother ID
+      F3_split_list <- vector("list", length(S3s_sel))
+      for (group in seq_along(S3s_sel)) {
+        group_pop  <- S3s_sel[[group]]
+        mother_ids <- unique(group_pop@mother)
+        F3_split   <- vector("list", length(mother_ids))
+        
+        for (i in seq_along(mother_ids)) {
+          F3_split[[i]] <- subset(group_pop, group_pop@mother == mother_ids[i])
+        }
+        
+        names(F3_split) <- as.character(mother_ids)
+        F3_split_list[[group]] <- F3_split
+      }
+      
+      S3s_sel <- F3_split_list
+      
+      # Collection of seeds from selected lines
+      S4 <- vector("list", length(S3s_sel))
+      for (group in seq_along(S3s_sel)) {
+        for (line in 1:length(S3s_sel[[group]])) {
+          S4[[group]][[line]] <- self(S3s_sel[[group]][[line]], nProgeny = 200)
+        }
+      }
+      
+      # Selfing in counter-season location to produce S5
+      S5 <- vector("list", length(S4))
+      for (group in seq_along(S4)) {
+        for (line in 1:length(S4[[group]])) {
+          S5[[group]][[line]] <- self(S4[[group]][[line]], nProgeny = 1)
+        }
+      }
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 2
+      ## ---------------------------------------------------------------
+      
+      # Selection of S2 (in this case F2) and creation of S3
+      # Split F2 into heterotic groups, disregarding line
+      F2_i <- mergePops(F2)
+      
+      G_ind   <- pullSnpGeno(F2_i)
+      AF_grpL <- lapply(parent_groups, \(p) colMeans(pullSnpGeno(p), na.rm = TRUE) / 2)
+      AF_grp  <- do.call(rbind, AF_grpL)
+      
+      # Global allele frequency
+      p_all <- colMeans(rbind(G_ind / 2, AF_grp), na.rm = TRUE)
+      
+      # MAF filter
+      keep   <- which(p_all > maf_min & p_all < 1 - maf_min)
+      G_ind  <- G_ind[, keep, drop = FALSE]
+      AF_grp <- AF_grp[, keep, drop = FALSE]
+      p_all  <- p_all[keep]
+      m      <- length(keep)
+      
+      # Standardization denominator
+      std <- sqrt(2 * p_all * (1 - p_all))
+      std[std == 0] <- 1
+      
+      # Z for individuals
+      Z_ind <- sweep(G_ind, 2, 2 * p_all, "-")
+      Z_ind <- sweep(Z_ind, 2, std, "/")
+      Z_ind[!is.finite(Z_ind)] <- 0
+      
+      # Z for group centers
+      Z_grp <- sweep(2 * AF_grp, 2, 2 * p_all, "-")
+      Z_grp <- sweep(Z_grp, 2, std, "/")
+      Z_grp[!is.finite(Z_grp)] <- 0
+      
+      # Similarity of each individual to each group center
+      S <- Z_ind %*% t(Z_grp) / m
+      
+      # Assign group = argmax similarity
+      group_assign <- max.col(S, ties.method = "random")
+      
+      # Store on Pop and split
+      F2_i@misc$cluster <- group_assign
+      assigned_groups <- lapply(split(seq_len(nInd(F2_i)), group_assign), function(idx) F2_i[idx])
+      
+      # Apply genomic selection on S2
+      S2 <- lapply(assigned_groups, function(group) {
+        predictEBV_BGLR(group, p_tr, bA, bD, mu)
+      })
+      
+      S2s_sel <- lapply(S2, function(group) {
+        selectInd(group, nInd = s2sel, use = "ebv")
+      })
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 1
+      ## ---------------------------------------------------------------
+      
+      # Year 1: Two cycles of population improvement and selection in F2
+      for (cycle in 1:nCyclesPI) {
+        if (cycle == 1) {
+          
+          # Predict EBV for parents
+          parent_groups <- lapply(parent_groups, function(group) {
+            predictEBV_BGLR(group, p_tr, bA, bD, mu)
+          })
+          
+          Parents_output <- mergePops(parent_groups)
+          
+          # Report prediction parents mean and F1-2
+          output$meanGParents[year] <- meanG(Parents_output)
+          output$varGParents[year]  <- varG(Parents_output)
+          output$varAParents[year]  <- varA(Parents_output)
+          output$varDParents[year]  <- varD(Parents_output)
+          
+          # Select parents and cross randomly among selected parents
+          parent_groups <- lapply(parent_groups, function(group) {
+            selectOP(
+              group,
+              nInd          = nInd(group),
+              nSeeds        = nOP,
+              probSelf      = 0.2,
+              pollenControl = FALSE,
+              use           = "ebv"
+            )
+          })
+          
+          # Predict EBV for parents again
+          parent_groups <- lapply(parent_groups, function(group) {
+            predictEBV_BGLR(group, p_tr, bA, bD, mu)
+          })
+          
+        } else {
+          
+          parent_groups <- lapply(parent_groups, function(group) {
+            selectOP(
+              group,
+              nInd          = nParents,
+              nSeeds        = nOP,
+              probSelf      = 0.2,
+              pollenControl = FALSE,
+              use           = "ebv"
+            )
+          })
+        }
+      }
+      
+      # Self the F1s
+      S1 <- lapply(parent_groups, function(group) {
+        self(group, nProgeny = nSelf, keepParents = FALSE)
+      })
+      
+      S2 <- lapply(S1, function(group) {
+        self(group, nProgeny = nself1, keepParents = FALSE)
+      })
+      
+      
+      ## ---------------------------------------------------------------
+      ## PREPARE TRAINING DATA
+      ## ---------------------------------------------------------------
+      
+      # Use per se performance data from S4 (only in first year's cycle) for training
+      S5_training <- replicate(n = 5, expr = { list() }, simplify = FALSE)
+      for (group in seq_along(S4)) {
+        for (line in 1:length(S4[[group]])) {
+          S5_training[[group]][[line]] <- selectInd(S4[[group]][[line]], nInd = 1, use = "rand")
+        }
+      }
+      
+      for (group in seq_along(S5_training)) {
+        S5_training[[group]] <- mergePops(unlist(S5_training[[group]]))
+      }
+      
+      # Set phenotype based on per se performance of lines
+      for (group in seq_along(S5_training)) {
+        S5_training[[group]] <- setPheno(S5_training[[group]], varE = varE, reps = reptraining)
+      }
+      
+      # Assign phenotypes to motherlines before merging S5 training
+      for (group in 1:length(S5_training)) {
+        for (individual in 1:length(S5_training[[group]])) {
+          S4[[group]][[individual]]@pheno[, 1] <- S5_training[[group]]@pheno[individual]
+        }
+      }
+      
+      # Merge S5 training
+      S5_training <- mergePops(S5_training)
+      
+      # Collect data on per se performance for added training population
+      add_training <- setPheno(add_training, varE = varE, reps = reptraining)
+      
+      # Append this year
+      year_key <- paste0("Y", year)
+      training_by_year[[year_key]] <- mergePops(list(S5_training, add_training))
+      
+      # Recompute p_tr from all training accumulated so far
+      training_all <- mergePops(training_by_year)
+      G_tr <- as.matrix(pullSnpGeno(training_all))
+      storage.mode(G_tr) <- "numeric"
+      p_tr <- colMeans(G_tr) / 2
+      q_tr <- 1 - p_tr
+      
+      genoA_list <- vector("list", length(training_by_year))
+      genoD_list <- vector("list", length(training_by_year))
+      y_list     <- vector("list", length(training_by_year))
+      
+      for (k in seq_along(training_by_year)) {
+        tr_pop <- training_by_year[[k]]
+        y_list[[k]] <- as.numeric(tr_pop@pheno)
+        
+        G <- as.matrix(pullSnpGeno(tr_pop))
+        storage.mode(G) <- "numeric"
+        stopifnot(ncol(G) == length(p_tr))
+        
+        A_blk <- sweep(G, 2, 2 * p_tr, "-")
+        het   <- (G == 1) * 1
+        D_blk <- sweep(het, 2, 2 * p_tr * q_tr, "-")
+        
+        genoA_list[[k]] <- A_blk
+        genoD_list[[k]] <- D_blk
+      }
+      
+      genoA <- do.call(rbind, genoA_list)
+      genoD <- do.call(rbind, genoD_list)
+      y     <- unlist(y_list)
+      
+      ETA <- list(
+        list(X = genoA, model = "BRR"),
+        list(X = genoD, model = "BRR")
+      )
+      
+      fit <- BGLR(y = y, ETA = ETA, nIter = 10000, burnIn = 3000, verbose = FALSE)
+      bA <- fit$ETA[[1]]$b
+      bD <- fit$ETA[[2]]$b
+      mu <- as.numeric(fit$mu)
+      
+      
+      ## ---------------------------------------------------------------
+      ## ACCURACY BENCHMARKING
+      ## ---------------------------------------------------------------
+      
+      # Before tester pop is updated
+      S2 <- lapply(S2, function(group) {
+        predictEBV_BGLR(group, p_tr, bA, bD, mu)
+      })
+      
+      # Progeny test benchmark
+      S2_dat <- mergePops(S2)
+      S3_dat <- mergePops(S3)
+      
+      S2_dat <- setPhenoProgTest(S2_dat, tester_pop, nMatePerInd = 100, use = "gv", H2 = 1)
+      S3_dat <- setPhenoProgTest(S3_dat, tester_pop, nMatePerInd = 100, use = "gv", H2 = 1)
+      
+      output$acc_progenytest_S2[year] <- cor(S2_dat@ebv, S2_dat@pheno, use = "complete.obs")
+      output$acc_progenytest_S3[year] <- cor(S3_dat@ebv, S3_dat@pheno, use = "complete.obs")
+      
+      # GCA benchmark
+      S2_dat <- setPhenoGCA(S2_dat, testers = tester_pop, H2 = 1.0)
+      output$acc_GCA_S2[year] <- cor(S2_dat@ebv, S2_dat@pheno, use = "complete.obs")
+      
+      S3_dat <- setPhenoGCA(S3_dat, testers = tester_pop, H2 = 1.0)
+      output$acc_GCA_S3[year] <- cor(S3_dat@ebv, S3_dat@pheno, use = "complete.obs")
+      
+      
+      ## ---------------------------------------------------------------
+      ## CREATION OF NEW ELITES / TESTER LINES
+      ## ---------------------------------------------------------------
+      
+      # Create list of testers/lines for synthetic variety from best performers
+      # from each heterotic group
+      elite <- vector("list", length(S4))
+      
+      elite <- lapply(S4, function(sublist) {
+        means <- sapply(sublist, function(pop) mean(pop@pheno))
+        best_idx <- which.max(means)
+        sublist[[best_idx]]
+      })
+      
+      for (group in seq_along(elite)) {
+        elite[[group]] <- selectInd(elite[[group]], nInd = 200, use = "rand")
+      }
+      
+      ### Produce elite line groups
+      G1 <- c(elite[[2]], elite[[3]], elite[[4]], elite[[5]])
+      G2 <- c(elite[[1]], elite[[3]], elite[[4]], elite[[5]])
+      G3 <- c(elite[[4]], elite[[1]], elite[[2]], elite[[5]])
+      G4 <- c(elite[[1]], elite[[2]], elite[[3]], elite[[5]])
+      G5 <- c(elite[[1]], elite[[2]], elite[[3]], elite[[4]])
+      
+      # Elite lines to use in first synthetics
+      synthetics <- list(G1, G2, G3, G4, G5)
+      
+      for (group in seq_along(elite)) {
+        elite[[group]] <- selectInd(elite[[group]], nInd = 1, use = "rand")
+      }
+      
+      # Create new tester pop for training
+      tester_pop <- c(elite[[1]], elite[[2]], elite[[3]], elite[[4]], elite[[5]])
+      
+      S5lastyear <- S5
+      
+      
+      ## ---------------------------------------------------------------
+      ## OUTPUT
+      ## ---------------------------------------------------------------
+      
+      syn0_dat <- mergePops(unlist(syn0))
+      syn1_dat <- mergePops(unlist(syn1))
+      syn2_dat <- mergePops(unlist(syn2))
+      
+      output$meanSyn0[year]     <- meanG(syn0_dat)
+      output$varGSyn0[year]     <- varG(syn0_dat)
+      output$varDSyn0[year]     <- varD(syn0_dat)
+      output$varASyn0[year]     <- varA(syn0_dat)
+      output$meanSyn2[year]     <- meanG(syn2_dat)
+      output$varGSyn2[year]     <- varG(syn2_dat)
+      output$varASyn2[year]     <- varA(syn2_dat)
+      output$varDSyn2[year]     <- varD(syn2_dat)
+      output$meanGvariety[year] <- meanG(synthetic_var)
+      output$varGvariety[year]  <- varG(synthetic_var)
+      output$accSyn1[year]      <- cor(syn1_dat@gv, syn1_dat@pheno)
+      output$accSyn2[year]      <- cor(syn2_dat@gv, syn2_dat@pheno)
+      
+      output$varGS2[year] <- varG(S2_dat)
+      output$varAS2[year] <- varA(S2_dat)
+      output$varDS2[year] <- varD(S2_dat)
+      
+    } else {
+      
+      ## ===============================================================
+      ## BREEDING YEARS 2-20
+      ## ===============================================================
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 7
+      ## ---------------------------------------------------------------
+      
+      # Open pollination of selected SYN2 lines to create SYN3
+      syn3 <- vector("list", length(Syn2_sel))
+      for (group in seq_along(Syn2_sel)) {
+        syn3[[group]] <- selectOP(
+          pop           = Syn2_sel[[group]],
+          nInd          = 500,
+          nSeeds        = 4,
+          probSelf      = selfing,
+          pollenControl = FALSE,
+          use           = "rand"
+        )
+      }
+      
+      # Variety release
+      synthetic_var <- mergePops(syn3)
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 6
+      ## ---------------------------------------------------------------
+      
+      # Selection from SYN1
+      Syn1_mean <- vector("list", length(syn1))
+      for (group in seq_along(syn1)) {
+        group_means <- sapply(syn1[[group]], function(pop) mean(pop@pheno, na.rm = TRUE))
+        Syn1_mean[[group]] <- data.frame(
+          index = seq_along(group_means),
+          mean_pheno = group_means
+        )
+      }
+      
+      Syn1_sel <- vector("list", length(syn1))
+      for (group in seq_along(syn1)) {
+        mean_df <- Syn1_mean[[group]]
+        top_indices <- order(mean_df$mean_pheno, decreasing = TRUE)[1:nsel_syn1]
+        Syn1_sel[[group]] <- syn1[[group]][top_indices]
+      }
+      
+      Syn1_sel <- unlist(Syn1_sel, recursive = FALSE)
+      
+      # Open pollination of selected SYN1 lines to produce SYN2
+      syn2 <- vector("list", length(Syn1_sel))
+      for (group in seq_along(Syn1_sel)) {
+        syn2[[group]] <- selectOP(
+          pop           = Syn1_sel[[group]],
+          nInd          = 500,
+          nSeeds        = 4,
+          probSelf      = selfing,
+          pollenControl = FALSE,
+          use           = "rand"
+        )
+        
+        syn2[[group]] <- setPheno(syn2[[group]], varE = varE, reps = repsyn2)
+      }
+      
+      # Selection from Syn2
+      Syn2_mean <- data.frame(
+        index = seq_along(syn2),
+        mean_pheno = sapply(syn2, function(pop) mean(pop@pheno, na.rm = TRUE))
+      )
+      
+      top_indices <- order(Syn2_mean$mean_pheno, decreasing = TRUE)[1:nsel_syn2]
+      Syn2_sel <- syn2[top_indices]
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 5
+      ## ---------------------------------------------------------------
+      
+      # Random open pollination of SYN0 to produce SYN1
+      syn1 <- vector("list", length(syn0))
+      for (group in seq_along(syn0)) {
+        syn0_group <- syn0[[group]]
+        syn1_group <- vector("list", length(syn0_group))
+        
+        for (i in seq_along(syn0_group)) {
+          pop_syn1 <- selectOP(
+            pop      = syn0_group[[i]],
+            nInd     = 2000,
+            nSeeds   = 1,
+            use      = "rand",
+            probSelf = selfing
+          )
+          
+          pop_syn1 <- setPheno(pop_syn1, varE = varE, reps = repsyn1)
+          syn1_group[[i]] <- pop_syn1
+        }
+        
+        syn1[[group]] <- syn1_group
+      }
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 4
+      ## ---------------------------------------------------------------
+      
+      # Create SYN0 by crossing all the synthetic components
+      S5_syn0 <- vector("list", length(S5))
+      for (group in seq_along(S5)) {
+        for (individual in 1:length(S5[[group]])) {
+          S5_syn0[[group]][[individual]] <- selectInd(S5[[group]][[individual]], nInd = 200, use = "rand")
+        }
+      }
+      
+      syn0 <- replicate(n = 5, expr = { list() }, simplify = FALSE)
+      for (group in seq_along(S5_syn0)) {
+        for (i in 1:length(S5_syn0[[group]])) {
+          open1 <- mergePops(list(S5_syn0[[group]][[i]], synthetics[[group]]))
+          syn0[[group]][[i]] <- selectOP(
+            open1,
+            nInd          = 1000,
+            nSeeds        = 2,
+            probSelf      = selfing,
+            pollenControl = FALSE,
+            use           = "rand"
+          )
+        }
+      }
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 3
+      ## ---------------------------------------------------------------
+      
+      # Self each line in isolation to create S3
+      S3 <- lapply(S2s_sel, function(s2) {
+        self(s2, nProgeny = nself2)
+      })
+      
+      # Apply genomic selection on S3
+      S3 <- lapply(S3, function(group) {
+        predictEBV_BGLR(group, p_tr, bA, bD, mu)
+      })
+      
+      S3s_sel <- lapply(S3, function(group) {
+        selectFam(group, nFam = s3sel, use = "ebv", famType = "F")
+      })
+      
+      # Split lines by mother ID
+      S3_split_list <- vector("list", length(S3s_sel))
+      for (group in seq_along(S3s_sel)) {
+        group_pop  <- S3s_sel[[group]]
+        mother_ids <- unique(group_pop@mother)
+        S3_split   <- vector("list", length(mother_ids))
+        
+        for (i in seq_along(mother_ids)) {
+          S3_split[[i]] <- subset(group_pop, group_pop@mother == mother_ids[i])
+        }
+        
+        names(S3_split) <- as.character(mother_ids)
+        S3_split_list[[group]] <- S3_split
+      }
+      
+      S3s_sel <- S3_split_list
+      
+      # Collection of seeds from selected lines
+      S4 <- vector("list", length(S3s_sel))
+      for (group in seq_along(S3s_sel)) {
+        for (line in 1:length(S3s_sel[[group]])) {
+          S4[[group]][[line]] <- self(S3s_sel[[group]][[line]], nProgeny = 200)
+        }
+      }
+      
+      # Selfing in counter-season location to produce S5
+      S5 <- vector("list", length(S4))
+      for (group in seq_along(S4)) {
+        for (line in 1:length(S4[[group]])) {
+          S5[[group]][[line]] <- self(S4[[group]][[line]], nProgeny = 1)
+        }
+      }
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 2
+      ## ---------------------------------------------------------------
+      
+      S2s_sel <- lapply(S2, function(s2) {
+        selectInd(s2, nInd = s2sel, use = "ebv")
+      })
+      
+      
+      ## ---------------------------------------------------------------
+      ## YEAR 1
+      ## ---------------------------------------------------------------
+      
+      # Year 1: Two cycles of population improvement and selection in F2
+      for (cycle in 1:nCyclesPI) {
+        if (cycle == 1) {
+          
+          # Predict EBV for parents
+          parent_groups <- lapply(parent_groups, function(group) {
+            predictEBV_BGLR(group, p_tr, bA, bD, mu)
+          })
+          
+          Parents_output <- mergePops(parent_groups)
+          
+          # Report parents mean and F1-2
+          output$meanGParents[year] <- meanG(Parents_output)
+          output$varGParents[year]  <- varG(Parents_output)
+          output$varAParents[year]  <- varA(Parents_output)
+          output$varDParents[year]  <- varD(Parents_output)
+          
+          # Select parents and cross randomly among selected parents
+          parent_groups <- lapply(parent_groups, function(group) {
+            selectOP(
+              group,
+              nInd          = nParents,
+              nSeeds        = nOP,
+              probSelf      = 0.2,
+              pollenControl = FALSE,
+              use           = "ebv"
+            )
+          })
+          
+          # Predict EBV for parents again
+          parent_groups <- lapply(parent_groups, function(group) {
+            predictEBV_BGLR(group, p_tr, bA, bD, mu)
+          })
+          
+        } else {
+          
+          parent_groups <- lapply(parent_groups, function(group) {
+            selectOP(
+              group,
+              nInd          = nParents,
+              nSeeds        = nOP,
+              probSelf      = 0.2,
+              pollenControl = FALSE,
+              use           = "ebv"
+            )
+          })
+        }
+      }
+      
+      # Self the F1s
+      S1 <- lapply(parent_groups, function(group) {
+        self(group, nProgeny = nSelf, keepParents = FALSE)
+      })
+      
+      S2 <- lapply(S1, function(group) {
+        self(group, nProgeny = nself1, keepParents = FALSE)
+      })
+      
+      # Apply genomic selection on S2
+      S2 <- lapply(S2, function(group) {
+        predictEBV_BGLR(group, p_tr, bA, bD, mu)
+      })
+      
+      
+      ## ---------------------------------------------------------------
+      ## PREPARE TRAINING DATA
+      ## ---------------------------------------------------------------
+      
+      # Use per se performance data from S5 last year for training
+      S5_training <- replicate(n = 5, expr = { list() }, simplify = FALSE)
+      for (group in seq_along(S5lastyear)) {
+        for (line in 1:length(S5lastyear[[group]])) {
+          S5_training[[group]][[line]] <- selectInd(S5lastyear[[group]][[line]], nInd = 1, use = "rand")
+        }
+      }
+      
+      for (group in seq_along(S5_training)) {
+        S5_training[[group]] <- mergePops(unlist(S5_training[[group]]))
+      }
+      
+      # Phenotype per se performance of lines
+      for (group in seq_along(S5_training)) {
+        S5_training[[group]] <- setPheno(S5_training[[group]], varE = varE, reps = reptraining)
+      }
+      
+      # Assign phenotypes to motherlines before merging S5 training
+      for (group in 1:length(S5_training)) {
+        for (individual in 1:length(S5_training[[group]])) {
+          S5lastyear[[group]][[individual]]@pheno[, 1] <- S5_training[[group]]@pheno[individual]
+        }
+      }
+      
+      # Merge S5 training
+      S5_training <- mergePops(S5_training)
+      
+      # Append this year
+      year_key <- paste0("Y", year)
+      training_by_year[[year_key]] <- S5_training
+      
+      # Recompute p_tr from all training accumulated so far
+      training_all <- mergePops(training_by_year)
+      G_tr <- as.matrix(pullSnpGeno(training_all))
+      storage.mode(G_tr) <- "numeric"
+      p_tr <- colMeans(G_tr) / 2
+      q_tr <- 1 - p_tr
+      
+      genoA_list <- vector("list", length(training_by_year))
+      genoD_list <- vector("list", length(training_by_year))
+      y_list     <- vector("list", length(training_by_year))
+      
+      for (k in seq_along(training_by_year)) {
+        tr_pop <- training_by_year[[k]]
+        y_list[[k]] <- as.numeric(tr_pop@pheno)
+        
+        G <- as.matrix(pullSnpGeno(tr_pop))
+        storage.mode(G) <- "numeric"
+        stopifnot(ncol(G) == length(p_tr))
+        
+        A_blk <- sweep(G, 2, 2 * p_tr, "-")
+        het   <- (G == 1) * 1
+        D_blk <- sweep(het, 2, 2 * p_tr * q_tr, "-")
+        
+        genoA_list[[k]] <- A_blk
+        genoD_list[[k]] <- D_blk
+      }
+      
+      genoA <- do.call(rbind, genoA_list)
+      genoD <- do.call(rbind, genoD_list)
+      y     <- unlist(y_list)
+      
+      ETA <- list(
+        list(X = genoA, model = "BRR"),
+        list(X = genoD, model = "BRR")
+      )
+      
+      fit <- BGLR(y = y, ETA = ETA, nIter = 10000, burnIn = 3000, verbose = FALSE)
+      bA <- fit$ETA[[1]]$b
+      bD <- fit$ETA[[2]]$b
+      mu <- as.numeric(fit$mu)
+      
+      
+      ## ---------------------------------------------------------------
+      ## ACCURACY BENCHMARKING
+      ## ---------------------------------------------------------------
+      
+      # Done before updating of testers
+      S2_dat <- mergePops(S2)
+      S3_dat <- mergePops(S3)
+      
+      S2_dat <- setPhenoProgTest(S2_dat, tester_pop, nMatePerInd = 100, use = "gv", H2 = 1)
+      S3_dat <- setPhenoProgTest(S3_dat, tester_pop, nMatePerInd = 100, use = "gv", H2 = 1)
+      
+      output$acc_progenytest_S2[year] <- cor(S2_dat@ebv, S2_dat@pheno, use = "complete.obs")
+      output$acc_progenytest_S3[year] <- cor(S3_dat@ebv, S3_dat@pheno, use = "complete.obs")
+      
+      # GCA benchmark
+      S2_dat <- setPhenoGCA(S2_dat, testers = tester_pop, H2 = 1.0)
+      output$acc_GCA_S2[year] <- cor(S2_dat@ebv, S2_dat@pheno, use = "complete.obs")
+      
+      S3_dat <- setPhenoGCA(S3_dat, testers = tester_pop, H2 = 1.0)
+      output$acc_GCA_S3[year] <- cor(S3_dat@ebv, S3_dat@pheno, use = "complete.obs")
+      
+      
+      ## ---------------------------------------------------------------
+      ## CREATE NEW ELITES / TESTER LINES
+      ## ---------------------------------------------------------------
+      
+      # Create list of testers/lines for synthetic variety from best performers
+      # from each heterotic group
+      elite <- vector("list", length(S5lastyear))
+      
+      elite <- lapply(S5lastyear, function(sublist) {
+        means <- sapply(sublist, function(pop) mean(pop@pheno))
+        best_idx <- which.max(means)
+        sublist[[best_idx]]
+      })
+      
+      for (group in seq_along(elite)) {
+        elite[[group]] <- selectInd(elite[[group]], nInd = 200, use = "rand")
+      }
+      
+      ### Produce elite line groups
+      G1 <- c(elite[[2]], elite[[3]], elite[[4]], elite[[5]])
+      G2 <- c(elite[[1]], elite[[3]], elite[[4]], elite[[5]])
+      G3 <- c(elite[[4]], elite[[1]], elite[[2]], elite[[5]])
+      G4 <- c(elite[[1]], elite[[2]], elite[[3]], elite[[5]])
+      G5 <- c(elite[[1]], elite[[2]], elite[[3]], elite[[4]])
+      
+      # Elite lines to use in first synthetics
+      synthetics <- list(G1, G2, G3, G4, G5)
+      
+      for (group in seq_along(elite)) {
+        elite[[group]] <- selectInd(elite[[group]], nInd = 1, use = "rand")
+      }
+      
+      # Create new tester pop for training
+      tester_pop <- c(elite[[1]], elite[[2]], elite[[3]], elite[[4]], elite[[5]])
+      
+      S5lastyear <- S5
+      
+      
+      ## ---------------------------------------------------------------
+      ## REPORT RESULTS
+      ## ---------------------------------------------------------------
+      
+      syn0_dat <- mergePops(unlist(syn0))
+      syn1_dat <- mergePops(unlist(syn1))
+      syn2_dat <- mergePops(unlist(syn2))
+      
+      output$meanSyn0[year]     <- meanG(syn0_dat)
+      output$varGSyn0[year]     <- varG(syn0_dat)
+      output$varDSyn0[year]     <- varD(syn0_dat)
+      output$varASyn0[year]     <- varA(syn0_dat)
+      output$meanSyn2[year]     <- meanG(syn2_dat)
+      output$varGSyn2[year]     <- varG(syn2_dat)
+      output$varASyn2[year]     <- varA(syn2_dat)
+      output$varDSyn2[year]     <- varD(syn2_dat)
+      output$meanGvariety[year] <- meanG(synthetic_var)
+      output$varGvariety[year]  <- varG(synthetic_var)
+      output$accSyn1[year]      <- cor(syn1_dat@gv, syn1_dat@pheno)
+      output$accSyn2[year]      <- cor(syn2_dat@gv, syn2_dat@pheno)
+      
+      output$varGS2[year] <- varG(S2_dat)
+      output$varAS2[year] <- varA(S2_dat)
+      output$varDS2[year] <- varD(S2_dat)
+    }
+  }
+  
+  output
+}
+
+
+## =====================================================================
+## RUN AND SAVE
+## =====================================================================
+out <- model.mse(rep_id)
+
+saveRDS(
+  out,
+  file = file.path(
+    workdir,
+    sprintf("GS_synthetic_2part_BGLR_perse_DD1_rep%03d.rds", rep_id)
+  )
+)
